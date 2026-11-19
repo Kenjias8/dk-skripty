@@ -42,6 +42,9 @@
     try { return Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem(LS_KEY) || '{}')); }
     catch (e) { return { ...DEFAULTS }; }
   }
+  const VERSION = '1.3';
+  const STALE_MS = 5 * 60 * 1000;   // po téhle době se údaje před „Poslat vše“ načtou znovu
+  let loadedAt = 0;                 // kdy se naposledy načetly vesnice
   const cfg = loadCfg();
   if (!['abs', 'avg', 'off'].includes(cfg.mixMode)) cfg.mixMode = cfg.mix === false ? 'off' : 'abs';
   const loadJSON = (k, d) => { try { const v = JSON.parse(localStorage.getItem(k)); return v == null ? d : v; } catch (e) { return d; } };
@@ -116,6 +119,8 @@
     if (!table) return null;
     const head = [...(table.querySelector('tr') || { cells: [] }).cells];
     const storIdx = head.findIndex(th => /sklad|storage|kapacita/i.test(th.textContent) || th.querySelector('img[src*="storage"], .storage'));
+    const merIdx = head.findIndex(th => /obchodn|merchant|trader/i.test(th.textContent + ' ' + (th.getAttribute('title') || '')) || th.querySelector('img[src*="market"], img[src*="merchant"], img[src*="trader"], [title*="bchodn"]'));
+    const farmIdx = head.findIndex(th => /selsk|farm|statek/i.test(th.textContent + ' ' + (th.getAttribute('title') || '')) || th.querySelector('img[src*="farm"], [title*="elsk"]'));
     const out = [];
     for (const row of table.querySelectorAll('tr')) {
       if (row.querySelector('th')) continue;
@@ -142,11 +147,19 @@
         const mm = /^(\d+)\/(\d+)$/.exec(c.textContent.replace(/\s+/g, ''));
         if (mm && c.querySelector('a[href*="market"]')) { merchants = +mm[1]; merchantsAll = +mm[2]; }
       }
-      if (merchants == null) {
-        for (const c of row.cells) {
+      if (merchants == null && merIdx >= 0 && row.cells[merIdx]) {
+        // sloupec „Obchodníci“ podle záhlaví; prázdná buňka = vesnice nemá tržiště
+        const t = row.cells[merIdx].textContent.replace(/[\s.]/g, '');
+        const mm = /^(\d+)\/(\d+)$/.exec(t);
+        if (mm) { merchants = +mm[1]; merchantsAll = +mm[2]; }
+        else if (!/\d/.test(t)) { merchants = 0; merchantsAll = 0; }
+      } else if (merchants == null) {
+        [...row.cells].some((c, ci) => {
+          if (ci === farmIdx) return false;
           const mm = /^(\d+)\/(\d+)$/.exec(c.textContent.replace(/[\s.]/g, ''));
-          if (mm && +mm[2] <= 300) { merchants = +mm[1]; merchantsAll = +mm[2]; break; }
-        }
+          if (mm && +mm[2] <= 300) { merchants = +mm[1]; merchantsAll = +mm[2]; return true; }
+          return false;
+        });
       }
       const storage = storIdx >= 0 && row.cells[storIdx] ? num(row.cells[storIdx].textContent) || null : null;
       out.push({ id, name: text.replace(/\s*\(\d{1,3}\|\d{1,3}\).*$/, '').trim(), x: +cm[1], y: +cm[2], ...res, merchants, merchantsAll, storage });
@@ -310,6 +323,7 @@
       (cur && RES.some(r => gv[r] > 1000 && Math.abs((cur[r] || 0) - gv[r]) > Math.max(2000, gv[r] * 0.2)));
     if (broken) list = await loadViaMarket(list || await loadMyVillageList(), onProgress);
     villages = list.filter(v => !v.err);
+    loadedAt = Date.now();
     await loadIncoming(onProgress);
     loadWorldSpeed();   // jen pro odhad příjezdu vlastních zásilek, nečeká se na něj
     return villages;
@@ -526,6 +540,54 @@
     });
   }
 
+  // Zásilka neprošla (typicky ve vesnici mezitím ubyli obchodníci nebo suroviny – stavba, rekrutace, jiný skript,
+  // správce účtu). Načte se skutečný stav té vesnice z jejího tržiště a všechny její ještě neodeslané zásilky se podle něj
+  // zmenší. Zmenšená zásilka se zkusí ještě jednou; když neprojde ani pak, zůstane ❌ s důvodem od hry.
+  async function fitSourceAfterFail(failed, msg) {
+    if (failed.retried) return;
+    failed.retried = true;
+    const v = failed.v;
+    setStatus(`${v.name}: zásilka neprošla (${msg}) – ověřuji skutečný stav vesnice…`);
+    let fresh = null;
+    try { fresh = (await loadViaMarket([v]))[0]; } catch (e) { return; }
+    if (!fresh || fresh.err) return;
+    const believed = v.merchants;   // s kolika volnými obchodníky skript počítal
+    for (const k of ['wood', 'stone', 'iron', 'merchants', 'merchantsAll', 'storage']) if (fresh[k] != null) v[k] = fresh[k];
+    let mer = v.merchants || 0;
+    const av = {};
+    for (const r of RES) av[r] = Math.max(0, Math.floor(((v[r] || 0) - cfg.reserve) / 100) * 100);
+    for (const sh of plan.ships) {
+      if (sh.v !== v) continue;
+      const st = sent.get(sh.key);
+      if (st && sh !== failed) continue;              // odeslané a dřívější chyby nechat
+      const send = {}, why = [];
+      let total = 0;
+      for (const r of RES) {
+        send[r] = Math.min(sh.send[r], av[r]);
+        if (send[r] < sh.send[r]) why.push(`${RES_NAME[r].toLowerCase()} ve vesnici jen ${fmt(v[r] || 0)}`);
+        total += send[r];
+      }
+      if (total > mer * cfg.cap) {
+        why.unshift(`volných obchodníků jen ${mer}` + (believed != null && believed !== v.merchants ? ` (skript počítal s ${believed})` : ''));
+        const k = mer * cfg.cap / total;
+        total = 0;
+        for (const r of RES) { send[r] = Math.floor(send[r] * k / 100 + 1e-9) * 100; total += send[r]; }
+      }
+      if (total === sh.total) {
+        // podle čerstvých údajů je všeho dost – zásilku, která neprošla, zkusit ještě jednou beze změny
+        if (sh === failed) { sh.note = 'neprošla, zkouší se znovu'; sent.delete(sh.key); }
+      } else if (total < Math.max(100, cfg.minSend)) {
+        sent.set(sh.key, 'err:' + (why.join(', ') || msg));
+        total = 0;
+      } else {
+        sh.send = send; sh.total = total; sh.merchants = Math.ceil(total / cfg.cap);
+        sh.note = 'zmenšeno – ' + why.join(', ');
+        sent.delete(sh.key);
+      }
+      if (total > 0) { mer -= Math.ceil(total / cfg.cap); for (const r of RES) av[r] -= (sent.has(sh.key) ? 0 : sh.send[r]); }
+    }
+  }
+
   // ================= UI =================
   let ui = null, busy = false, sendingAll = false;
 
@@ -535,6 +597,8 @@
     st.textContent = `
       #dkb{position:fixed;inset:4vh 3vw;z-index:100001;background:#f4e4bc;border:2px solid #7d510f;border-radius:8px;display:none;flex-direction:column;
         font:13px Verdana,Arial,sans-serif;color:#000;box-shadow:0 4px 20px rgba(0,0,0,.5)}
+      #dkb select{max-width:100%}
+      #dkb .opts label{max-width:100%}
       #dkb .hd{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#c1a264;border-bottom:1px solid #7d510f;border-radius:6px 6px 0 0}
       #dkb .hd b{flex:1;font-size:15px}
       #dkb .bd{flex:1;overflow:auto;padding:8px 10px}
@@ -546,6 +610,7 @@
       #dkb .sum{background:#fff8e6;border:1px solid #c1a264;border-radius:4px;padding:6px 8px;margin-bottom:8px}
       #dkb .o{color:#6b5a3a;font-size:11px}
       #dkb .warn{color:#8b0000}
+      #dkb .why{color:#8b0000;font-size:11px;white-space:normal}
       #dkb details{margin-bottom:8px}
       #dkb summary{cursor:pointer;font-weight:bold;padding:4px 0}
       #dkb table{width:100%;border-collapse:collapse}
@@ -592,7 +657,7 @@
     const w = document.createElement('div');
     w.id = 'dkb';
     w.innerHTML = `
-      <div class="hd"><b>⚖️ Balanc surovin</b><button type="button" class="btn" data-close>✖</button></div>
+      <div class="hd"><b>⚖️ Balanc surovin <span style="font-weight:normal;font-size:11px;opacity:.7">${VERSION}</span></b><button type="button" class="btn" data-close>✖</button></div>
       <div class="bd">
         <details class="optbox"><summary>⚙️ Nastavení</summary>
           <div class="opts">
@@ -699,7 +764,9 @@
         (cfg.mixMode === 'abs' ? `<div class="o">⚖️ Přísně mezi surovinami: do vesnice nejde surovina, které tam je víc než té, které má nejmíň (v % skladu, rezerva 1 %). Když železo není odkud vzít, nejde tam ani dřevo a hlína.</div>`
           : cfg.mixMode === 'avg' ? `<div class="o">⚖️ Mezi surovinami podle průměru účtu: každá surovina se dorovnává na své průměrné % skladu, nedostatková má přednost.</div>` : '') +
         wayHtml() +
-        `<div class="o">Nikdy se nepošle víc, než se vejde do skladu příjemce.</div>`;
+        (todo.length && Date.now() - loadedAt > STALE_MS ? `<div class="warn">⏱ Údaje jsou ${Math.round((Date.now() - loadedAt) / 60000)} min staré. „Poslat vše“ si je napřed načte znovu; při posílání po jedné klikni na „Načíst vesnice“.</div>` : '') +
+        (failedCount() ? `<div class="warn">❌ Nepovedlo se ${failedCount()} zásilek – důvod je u každé v seznamu.</div>` : '') +
+        `<div class="o">Nikdy se nepošle víc, než se vejde do skladu příjemce. Když zásilka neprojde, skript si ověří skutečný stav vesnice a pošle, co opravdu jde.</div>`;
 
     // vesnice: zaplnění teď → po balancu
     vlist.innerHTML = `<table><thead><tr><th></th><th>Vesnice</th><th>Sklad</th>${RES.map(r => `<th>${RES_NAME[r]} teď → potom</th>`).join('')}<th>Obch.</th></tr></thead><tbody>${
@@ -731,9 +798,10 @@
           <td data-l="Z">${esc(s.v.name)} <span class="o">(${s.v.x}|${s.v.y})</span></td>
           <td data-l="Do">${esc(s.to.name)} <span class="o">(${s.to.x}|${s.to.y})</span></td>
           <td class="n" data-l="Vzdálenost">${s.d.toFixed(1)}</td>
-          <td data-l="Pošle se">${RES.filter(r => s.send[r]).map(r => `<span class="ic" style="background:${RES_COLOR[r]}"></span>${fmt(s.send[r])}`).join(' ')}</td>
+          <td data-l="Pošle se">${RES.filter(r => s.send[r]).map(r => `<span class="ic" style="background:${RES_COLOR[r]}"></span>${fmt(s.send[r])}`).join(' ')}` +
+            (s.note ? ` <span class="why">✂ ${esc(s.note)}</span>` : '') + `</td>
           <td class="n" data-l="Obchodníci">${s.merchants}</td>
-          <td>${st === 'ok' ? '✅' : st ? `<span title="${esc(st.slice(4))}">❌</span>` : `<button type="button" class="btn" data-send="${s.key}">Poslat</button>`}</td></tr>`;
+          <td>${st === 'ok' ? '✅' : st ? `❌ <span class="why">${esc(st.slice(4))}</span>` : `<button type="button" class="btn" data-send="${s.key}">Poslat</button>`}</td></tr>`;
       }).join('')}</tbody></table>` : '';
     slist.querySelectorAll('[data-send]').forEach(b => {
       b.onclick = () => { const s = plan.ships.find(x => x.key === b.dataset.send); if (s) doSend(s); };
@@ -756,6 +824,7 @@
   }
 
   const nextShip = () => plan.ships.find(s => !sent.has(s.key));
+  const failedCount = () => plan.ships.filter(s => String(sent.get(s.key) || '').startsWith('err')).length;
 
   function updateButtons() {
     if (!ui) return;
@@ -788,8 +857,12 @@
       s.v.merchants = Math.max(0, (s.v.merchants || 0) - s.merchants);
       trackWay(s);
     }
+    // chyba, která není ochrana proti botům: ověřit skutečný stav vesnice a zásilky z ní upravit
+    if (!res.ok && !/bot|ochran|captcha/i.test(res.msg)) {
+      try { await fitSourceAfterFail(s, res.msg); } catch (e) { /* zůstane ❌ */ }
+    }
     busy = false;
-    setStatus((res.ok ? '✅ ' : '❌ ') + `${s.v.name} → ${s.to.name}: ${res.msg}`);
+    setStatus((res.ok ? '✅ ' : '❌ ') + `${s.v.name} → ${s.to.name}: ${res.msg}` + (!res.ok && !sent.has(s.key) ? ' – zásilka upravena, zkusí se znovu' : ''));
     if (!sendingAll) gameMsg(`${s.v.name} → ${s.to.name}: ${res.msg}`, !res.ok);
     render();
     return res;
@@ -799,6 +872,12 @@
 
   async function sendAll() {
     if (sendingAll) { sendingAll = false; setStatus('Zastavuji…'); return; }
+    if (busy) return;
+    // údaje starší než 5 minut: napřed načíst znovu, ať se neposílá podle starého stavu
+    if (Date.now() - loadedAt > STALE_MS) {
+      await reload();
+      if (/⚠️/.test(ui.q('[data-st]').textContent)) return;
+    }
     const todo = plan.ships.filter(s => !sent.has(s.key));
     if (!todo.length) return;
     const pMin = Math.min(cfg.pauseMin, cfg.pauseMax), pMax = Math.max(cfg.pauseMin, cfg.pauseMax);
@@ -810,6 +889,7 @@
       if (!nx) break;
       const res = await doSend(nx);
       if (res.ok) { done++; fails = 0; }
+      else if (!sent.has(nx.key)) { /* zásilka se upravila podle skutečného stavu vesnice a zkusí se znovu */ }
       else {
         bad++; fails++;
         if (/bot|ochran|captcha/i.test(res.msg)) { setStatus('⚠️ Ochrana proti botům – zastaveno. Vyřeš ji ve hře.'); break; }
@@ -825,7 +905,8 @@
     }
     const stopped = !sendingAll;
     sendingAll = false;
-    const msg = `${stopped ? 'Zastaveno' : 'Hotovo'} – odesláno ${done} zásilek` + (bad ? `, ${bad} se nepovedlo` : '') + '.';
+    bad = failedCount();   // i zásilky, které po ověření stavu vesnice nešly poslat vůbec
+    const msg = `${stopped ? 'Zastaveno' : 'Hotovo'} – odesláno ${done} zásilek` + (bad ? `, ${bad} se nepovedlo (důvod je u nich v seznamu)` : '') + '.';
     if (!/⚠️/.test(ui.q('[data-st]').textContent)) setStatus((bad ? '⚠️ ' : '✅ ') + msg);
     gameMsg(msg, bad > 0);
     render();
